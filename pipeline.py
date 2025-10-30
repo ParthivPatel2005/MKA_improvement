@@ -1,5 +1,6 @@
 import os
 import torch
+import torch.nn as nn
 from transformers import (
     AutoModelForCausalLM,  
     AutoTokenizer,        
@@ -16,6 +17,9 @@ from sklearn.neighbors import NearestNeighbors
 import pickle          
 import logging         
 import gc              
+from torch.utils.data import DataLoader, Dataset
+
+from mergeable_layer import MergeableLayer, create_mergeable_layer
 
 # Define the possible choices for multiple-choice questions
 choices = ["A", "B", "C", "D"]
@@ -611,6 +615,228 @@ def layer_fusion(model, layer1_idx, layer2_idx, ratio_i, weight_types):
     print(f"Model layers after removal of layer {layer2_idx}")
     return model
 
+
+class _CalibrationDataset(Dataset):
+    """Dataset that surfaces calibration prompts for learnable alpha training."""
+
+    def __init__(
+        self,
+        tokenizer,
+        data_dir,
+        num_samples=1000,
+        seed=7,
+    ):
+        self.tokenizer = tokenizer
+        self.prompts = []
+        rng = random.Random(seed)
+        dev_dir = os.path.join(data_dir, "dev")
+        if not os.path.isdir(dev_dir):
+            raise FileNotFoundError(f"Calibration data directory missing: {dev_dir}")
+
+        subject_files = sorted(
+            entry for entry in os.listdir(dev_dir) if entry.endswith("_dev.csv")
+        )
+        if not subject_files:
+            raise RuntimeError("No dev split CSV files found for calibration")
+
+        quota = max(1, num_samples // len(subject_files))
+
+        for file_name in subject_files:
+            df = pd.read_csv(os.path.join(dev_dir, file_name), header=None)
+            indices = list(range(len(df)))
+            rng.shuffle(indices)
+            take = min(len(indices), quota)
+            for idx in indices[:take]:
+                prompt = format_example(df, idx, include_answer=True)
+                self.prompts.append(prompt)
+                if len(self.prompts) >= num_samples:
+                    return
+
+    def __len__(self):
+        return len(self.prompts)
+
+    def __getitem__(self, idx):
+        return self.prompts[idx]
+
+
+def prepare_calibration_dataloader(
+    tokenizer,
+    data_dir,
+    batch_size=4,
+    num_samples=1000,
+    max_seq_length=512,
+    seed=7,
+):
+    dataset = _CalibrationDataset(
+        tokenizer=tokenizer,
+        data_dir=data_dir,
+        num_samples=num_samples,
+        seed=seed,
+    )
+
+    def collate(batch):
+        encodings = tokenizer(
+            batch,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_seq_length,
+        )
+        encodings["labels"] = encodings["input_ids"].clone()
+        return encodings
+
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate)
+
+
+def replace_layers_with_mergeable(
+    model,
+    merge_pairs,
+    alpha_init_strategy="similarity",
+):
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = model.model.layers
+    else:
+        layers = model.layers
+
+    def _alpha_from_strategy(score):
+        if alpha_init_strategy == "similarity":
+            return float(score)
+        if alpha_init_strategy == "uniform":
+            return 0.5
+        if alpha_init_strategy == "fixed_07":
+            return 0.7
+        raise ValueError(f"Unknown alpha init strategy: {alpha_init_strategy}")
+
+    for layer_l_idx, layer_m_idx, sim_score in sorted(merge_pairs, key=lambda x: x[0], reverse=True):
+        layer_l = layers[layer_l_idx]
+        layer_m = layers[layer_m_idx]
+        mergeable = create_mergeable_layer(
+            layer_l,
+            layer_m,
+            alpha_init=_alpha_from_strategy(sim_score),
+        )
+        setattr(mergeable, "layer_pair", (layer_l_idx, layer_m_idx))
+        layers[layer_l_idx] = mergeable
+        layers[layer_m_idx] = nn.Identity()
+
+    return model
+
+
+def train_alpha_parameters(
+    model,
+    calibration_dataloader,
+    num_steps=500,
+    learning_rate=1e-4,
+    device="cuda",
+):
+    if num_steps <= 0:
+        return model
+
+    alpha_params = []
+    for name, param in model.named_parameters():
+        param.requires_grad = False
+        if "alpha_logit" in name or "alpha_raw" in name:
+            param.requires_grad = True
+            alpha_params.append(param)
+
+    if not alpha_params:
+        print("No alpha parameters found; skipping training.")
+        return model
+
+    optimizer = torch.optim.Adam(alpha_params, lr=learning_rate)
+    model.train()
+    losses = []
+    data_iter = iter(calibration_dataloader)
+
+    if isinstance(device, str):
+        target_device = torch.device(device)
+    else:
+        target_device = device
+    try:
+        ref_param = next(model.parameters())
+        target_device = ref_param.device
+    except StopIteration:
+        pass
+
+    for step in tqdm(range(num_steps), desc="Training alpha"):
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(calibration_dataloader)
+            batch = next(data_iter)
+
+        batch = {
+            k: v.to(target_device) if hasattr(v, "to") else v for k, v in batch.items()
+        }
+        outputs = model(**batch)
+        loss = outputs.loss
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+
+        if (step + 1) % 10 == 0:
+            window = losses[-10:]
+            print(f"Step {step + 1}: loss={np.mean(window):.4f}")
+
+    print(f"Training completed. Final loss: {np.mean(losses[-10:]):.4f}")
+    model.eval()
+    return model
+
+
+def extract_learned_alphas(model, merge_pairs):
+    learned = {}
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = model.model.layers
+    else:
+        layers = model.layers
+
+    for layer_l_idx, layer_m_idx, _ in merge_pairs:
+        module = layers[layer_l_idx]
+        if isinstance(module, MergeableLayer):
+            pair = getattr(module, "layer_pair", (layer_l_idx, layer_m_idx))
+            learned_key = f"{pair[0]}_{pair[1]}"
+            learned[learned_key] = float(module.alpha.detach().cpu().item())
+    return learned
+
+
+def _fuse_layers(layer_l, layer_m, alpha):
+    import copy
+
+    fused_layer = copy.deepcopy(layer_l)
+    fused_state = fused_layer.state_dict()
+    state_l = layer_l.state_dict()
+    state_m = layer_m.state_dict()
+    for key in fused_state:
+        fused_state[key] = alpha * state_l[key] + (1.0 - alpha) * state_m[key]
+    fused_layer.load_state_dict(fused_state)
+    return fused_layer
+
+
+def fuse_mergeable_layers(model):
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = model.model.layers
+    else:
+        layers = model.layers
+
+    new_layers = []
+    for layer in layers:
+        if isinstance(layer, MergeableLayer):
+            alpha = float(layer.alpha.detach().cpu().item())
+            new_layers.append(_fuse_layers(layer.layer_l, layer.layer_m, alpha))
+        elif isinstance(layer, nn.Identity):
+            continue
+        else:
+            new_layers.append(layer)
+
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        model.model.layers = nn.ModuleList(new_layers)
+    else:
+        model.layers = nn.ModuleList(new_layers)
+
+    model.config.num_hidden_layers = len(new_layers)
+    return model
+
 def main():
     """
     The main function that orchestrates the entire process: parsing arguments, loading the model,
@@ -625,6 +851,14 @@ def main():
     parser.add_argument("--num_samples", "-m", type=int, default=1, help="Number of samples per task (default: 1)")
     parser.add_argument("--data_dir", "-d", type=str, default="data", help="Directory containing the data")
     parser.add_argument("--num_layer", "-i", type=int, default=1, help="Number of layers to fuse (default: 1)")
+    parser.add_argument("--use_learnable_alpha", action="store_true", help="Enable learnable alpha layer merging")
+    parser.add_argument("--alpha_training_steps", type=int, default=500, help="Number of training steps for alpha parameters")
+    parser.add_argument("--alpha_learning_rate", type=float, default=1e-4, help="Learning rate for alpha training")
+    parser.add_argument("--alpha_init_strategy", type=str, default="uniform", choices=["similarity", "uniform", "fixed_07"], help="Initialisation strategy for alpha values")
+    parser.add_argument("--calibration_samples", type=int, default=1000, help="Number of calibration samples for alpha training")
+    parser.add_argument("--calibration_batch_size", type=int, default=4, help="Batch size for calibration dataloader")
+    parser.add_argument("--calibration_seed", type=int, default=7, help="Random seed for calibration sampling")
+    parser.add_argument("--calibration_max_seq_len", type=int, default=512, help="Maximum sequence length for calibration prompts")
     args = parser.parse_args()
 
     # Extract the model name from the provided model path
@@ -642,6 +876,8 @@ def main():
     os.makedirs(embeddings_dir, exist_ok=True)
     os.makedirs(fusion_info_dir, exist_ok=True)
     os.makedirs(merged_weights_dir, exist_ok=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Configure logging to write logs to a file within fusion_info_dir
     logging.basicConfig(filename=os.path.join(fusion_info_dir, 'experiment.log'), level=logging.INFO)
@@ -743,26 +979,72 @@ def main():
     # Compute the similarity matrix based on the loaded embeddings
     similarity_matrix = compute_similarity_matrix_npib_global(embeddings)
 
-    # Merge layers iteratively from the last layer towards the first
-    for _ in range(args.num_layer):
-        if num_layers <= 1:
-            break  # Stop if there is only one layer left
+    merge_pairs = []
+    similarity_scores = {}
+    temp_layers = num_layers
+    for _ in range(min(args.num_layer, num_layers - 1)):
+        if temp_layers <= 1:
+            break
+        layer1_idx = temp_layers - 2
+        layer2_idx = temp_layers - 1
+        sim_score = float(similarity_matrix[layer1_idx, layer2_idx])
+        merge_pairs.append((layer1_idx, layer2_idx, sim_score))
+        similarity_scores[f"{layer1_idx}_{layer2_idx}"] = sim_score
+        temp_layers -= 1
 
-        # Define the indices of the two layers to fuse (last two layers)
-        layer1_idx = num_layers - 2
-        layer2_idx = num_layers - 1
+    if args.use_learnable_alpha and merge_pairs:
+        print("\n" + "=" * 60)
+        print("LEARNABLE ALPHA MODE")
+        print("=" * 60)
 
-        # Compute fusion ratios for the current pair of layers based on similarity
-        fusion_ratios = compute_fusion_ratios(similarity_matrix, [(layer1_idx, layer2_idx)])
-        adjusted_ratio_i, adjusted_ratio_j = fusion_ratios[0]
+        model = replace_layers_with_mergeable(
+            model,
+            merge_pairs,
+            alpha_init_strategy=args.alpha_init_strategy,
+        )
 
-        print(f"Merging Layer {layer1_idx} (Fusion Ratio: {adjusted_ratio_i:.4f}) and Layer {layer2_idx} (Fusion Ratio: {adjusted_ratio_j:.4f})")
+        calibration_loader = prepare_calibration_dataloader(
+            tokenizer=tokenizer,
+            data_dir=args.data_dir,
+            batch_size=args.calibration_batch_size,
+            num_samples=args.calibration_samples,
+            max_seq_length=args.calibration_max_seq_len,
+            seed=args.calibration_seed,
+        )
 
-        # Perform the actual layer fusion using the computed ratios
-        merged_model = layer_fusion(model, layer1_idx, layer2_idx, adjusted_ratio_i, weight_types)
-        model = merged_model  # Update the model with the fused layers
+        model = train_alpha_parameters(
+            model,
+            calibration_loader,
+            num_steps=args.alpha_training_steps,
+            learning_rate=args.alpha_learning_rate,
+            device=device,
+        )
 
-        num_layers -= 1  # Decrement the layer count as one layer has been merged
+        learned_alphas = extract_learned_alphas(model, merge_pairs)
+        learned_payload = {
+            "learned_alphas": learned_alphas,
+            "similarity_scores": similarity_scores,
+        }
+        with open(os.path.join(merged_weights_dir, "learned_alphas.json"), "w") as f:
+            json.dump(learned_payload, f, indent=2)
+
+        model = fuse_mergeable_layers(model)
+        num_layers = model.config.num_hidden_layers
+
+    else:
+        for layer1_idx, layer2_idx, _ in merge_pairs:
+            fusion_ratios = compute_fusion_ratios(
+                similarity_matrix, [(layer1_idx, layer2_idx)]
+            )
+            adjusted_ratio_i, adjusted_ratio_j = fusion_ratios[0]
+            print(
+                f"Merging Layer {layer1_idx} (Fusion Ratio: {adjusted_ratio_i:.4f}) "
+                f"and Layer {layer2_idx} (Fusion Ratio: {adjusted_ratio_j:.4f})"
+            )
+            model = layer_fusion(
+                model, layer1_idx, layer2_idx, adjusted_ratio_i, weight_types
+            )
+            num_layers -= 1
 
     # Log the completion of layer fusion
     logging.info(f"Completed layer fusion with {args.num_layer} layers.")

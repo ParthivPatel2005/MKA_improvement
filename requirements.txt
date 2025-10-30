@@ -1,0 +1,12 @@
+torch
+transformers
+numpy
+pandas
+scikit-learn
+tqdm
+matplotlib>=3.5.0
+seaborn>=0.11.0
+datasets>=2.0.0
+scipy>=1.7.0
+jupyter>=1.0.0
+tensorboard>=2.8.0

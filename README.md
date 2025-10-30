@@ -4,6 +4,14 @@
 
 This project provides a comprehensive pipeline for **fusing layers in pre-trained causal language models** using manifold learning techniques. Layer fusion aims to reduce the number of layers in a model by intelligently combining similar layers, potentially leading to more efficient models without significant loss in performance.
 
+### Learnable Alpha Extension
+
+- `mergeable_layer.py` introduces learnable wrappers that blend two frozen transformer blocks with a trainable coefficient.
+- `train_learnable_alpha.py` automates similarity loading, layer replacement, alpha training, and fusion export.
+- `evaluate_methods.py` benchmarks original heuristics, fixed alphas, and the learnable variant on the MMLU suite.
+- `plot_results.py` visualises accuracy deltas and alpha distributions; `run_experiment.sh` ties the full workflow together.
+- Enable the new mode directly in `pipeline.py` with `--use_learnable_alpha` plus calibration flags to learn alphas in-place.
+
 The pipeline involves:
 
 1. **Model Evaluation:** Assessing the model's performance on multiple-choice datasets.
