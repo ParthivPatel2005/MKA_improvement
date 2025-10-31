@@ -6,11 +6,38 @@ This project provides a comprehensive pipeline for **fusing layers in pre-traine
 
 ### Learnable Alpha Extension
 
-- `mergeable_layer.py` introduces learnable wrappers that blend two frozen transformer blocks with a trainable coefficient.
-- `train_learnable_alpha.py` automates similarity loading, layer replacement, alpha training, and fusion export.
-- `evaluate_methods.py` benchmarks original heuristics, fixed alphas, and the learnable variant on the MMLU suite.
-- `plot_results.py` visualises accuracy deltas and alpha distributions; `run_experiment.sh` ties the full workflow together.
-- Enable the new mode directly in `pipeline.py` with `--use_learnable_alpha` plus calibration flags to learn alphas in-place.
+This project extends the original MKA method with **two novel approaches**:
+
+#### 1. Learnable Scalar Alpha (Trainable Parameter)
+- **What**: Treats α as a single trainable scalar per layer pair
+- **How**: Freezes both layers, trains only α via gradient descent
+- **Usage**: `--use_learnable_alpha` flag
+- **Command**:
+  ```bash
+  python pipeline.py --model_path "meta-llama/Meta-Llama-3-8B" \
+    --num_layer 14 --data_dir "./data" --use_learnable_alpha \
+    --alpha_training_steps 500 --alpha_learning_rate 1e-4
+  ```
+
+#### 2. MLP-Based Dynamic Merging
+- **What**: Small MLP predicts α dynamically based on activation statistics
+- **How**: MLP takes (mean, std, min, max) and outputs α ∈ [0,1]
+- **Usage**: Add `--use_mlp_merge` flag
+- **Command**:
+  ```bash
+  python pipeline.py --model_path "meta-llama/Meta-Llama-3-8B" \
+    --num_layer 14 --data_dir "./data" --use_learnable_alpha --use_mlp_merge \
+    --alpha_training_steps 500 --alpha_learning_rate 1e-4
+  ```
+
+#### Comparison Suite
+- **Original MKA** (α = S_lm), **Fixed α = 0.5**, **Fixed α = 0.7**
+- **Learned Scalar α**, **Learned MLP α** (use `--include_mlp` in evaluate_methods.py)
+
+- `mergeable_layer.py` implements both variants
+- `train_learnable_alpha.py` automates training pipeline
+- `evaluate_methods.py` benchmarks all methods
+- `plot_results.py` visualises results
 
 The pipeline involves:
 

@@ -20,12 +20,13 @@ pipeline with learnable alpha capabilities and accompanying experiment tooling.
 ## Core Pipeline Enhancements (`pipeline.py`)
 
 - Imported `mergeable_layer` utilities; added learnable-alpha CLI flags
-  (`--use_learnable_alpha`, calibration controls, alpha hyperparameters).
+  (`--use_learnable_alpha`, `--use_mlp_merge`, calibration controls, alpha hyperparameters).
 - Added calibration dataset/dataloader helpers, mergeable-layer replacement logic,
   alpha training routine, learned-alpha extraction, and permanent fusion helpers.
 - Branch main execution to support both original similarity-based merging and the
   new learnable-alpha path; persists learned coefficients to
   `merged_weights/learned_alphas.json`.
+- **Two distinct modes**: scalar α (trainable parameter) and MLP α (dynamic prediction).
 
 ### New/Updated Helper Functions
 
@@ -34,14 +35,15 @@ pipeline with learnable alpha capabilities and accompanying experiment tooling.
 - `prepare_calibration_dataloader`: wraps `_CalibrationDataset` with tokenizer
   collate function, yielding batches for fine-tuning `alpha` parameters.
 - `replace_layers_with_mergeable`: swaps selected transformer blocks with
-  `MergeableLayer` wrappers according to a chosen initialisation strategy.
+  `MergeableLayer` or `MLPMergeableLayer` wrappers based on `use_mlp` flag.
 - `train_alpha_parameters`: trains only the mergeable-layer coefficients using the
-  calibration dataloader.
-- `extract_learned_alphas`: collects the learned alpha values for reporting.
+  calibration dataloader (works for both scalar and MLP modes).
+- `extract_learned_alphas`: collects the learned alpha values for reporting (marks
+  MLP layers with -1.0 indicator).
 - `_fuse_layers`: blends two frozen blocks into a single fused block using the
   learned coefficient.
 - `fuse_mergeable_layers`: replaces mergeable wrappers with permanently fused
-  layers and updates the model configuration.
+  layers and updates the model configuration (MLP layers fused with 0.5 ratio).
 
 ## Documentation & Dependencies
 

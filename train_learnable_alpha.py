@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from mergeable_layer import MergeableLayer, create_mergeable_layer
+from mergeable_layer import MergeableLayer, MLPMergeableLayer, create_mergeable_layer
 
 CHOICES = ["A", "B", "C", "D"]
 
@@ -108,6 +108,7 @@ class LearnableAlphaConfig:
     num_training_steps: int = 500
     max_seq_length: int = 512
     random_seed: int = 7
+    use_mlp: bool = False
 
 
 class LearnableAlphaMKA:
@@ -214,6 +215,8 @@ class LearnableAlphaMKA:
             raise RuntimeError("Call identify_merge_pairs() before replacing layers")
 
         pairs = sorted(self.merge_pairs, key=lambda p: p[0], reverse=True)
+        mode = "mlp" if self.config.use_mlp else "simple"
+        
         for layer_l_idx, layer_m_idx, score in pairs:
             if layer_l_idx >= len(self.transformer_layers) or layer_m_idx >= len(self.transformer_layers):
                 raise IndexError("Merge pair indices exceed available layers")
@@ -224,12 +227,13 @@ class LearnableAlphaMKA:
             layer_m = self.transformer_layers[layer_m_idx]
 
             alpha_init = self._determine_alpha_init(score)
-            mergeable = create_mergeable_layer(layer_l, layer_m, alpha_init=alpha_init)
+            mergeable = create_mergeable_layer(layer_l, layer_m, alpha_init=alpha_init, mode=mode)
             setattr(mergeable, "layer_pair", (layer_l_idx, layer_m_idx))
             self.transformer_layers[layer_l_idx] = mergeable
             self.transformer_layers[layer_m_idx] = nn.Identity()
             self.logger.info(
-                "Inserted MergeableLayer for (%d, %d) with alpha_init=%.4f",
+                "Inserted %s for (%d, %d) with alpha_init=%.4f",
+                mode.upper() + "MergeableLayer",
                 layer_l_idx,
                 layer_m_idx,
                 alpha_init,
@@ -276,7 +280,7 @@ class LearnableAlphaMKA:
         for param in self.model.parameters():
             param.requires_grad = False
         for module in self.model.modules():
-            if isinstance(module, MergeableLayer):
+            if isinstance(module, (MergeableLayer, MLPMergeableLayer)):
                 for param in module.parameters():
                     if param.requires_grad:
                         alpha_params.append(param)
@@ -323,6 +327,14 @@ class LearnableAlphaMKA:
                 else:
                     key = name
                 learned[key] = float(module.alpha.detach().cpu().item())
+            elif isinstance(module, MLPMergeableLayer):
+                pair = getattr(module, "layer_pair", None)
+                if pair is not None:
+                    key = f"{pair[0]}_{pair[1]}_mlp"
+                else:
+                    key = name
+                # For MLP, store a placeholder since alpha is dynamic
+                learned[key] = -1.0  # Indicates MLP mode
         return learned
 
     def bake_alphas_and_fuse(self, output_path: str) -> None:
@@ -333,6 +345,11 @@ class LearnableAlphaMKA:
             if isinstance(layer, MergeableLayer):
                 alpha = float(layer.alpha.detach().cpu().item())
                 fused_layer = self._fuse_layer_weights(layer.layer_l, layer.layer_m, alpha)
+                fused_layers.append(fused_layer)
+            elif isinstance(layer, MLPMergeableLayer):
+                # For MLP, use 0.5 as default fusion ratio since alpha is input-dependent
+                self.logger.warning("MLP layer fusion uses fixed 0.5 ratio")
+                fused_layer = self._fuse_layer_weights(layer.layer_l, layer.layer_m, 0.5)
                 fused_layers.append(fused_layer)
             elif isinstance(layer, nn.Identity):
                 continue

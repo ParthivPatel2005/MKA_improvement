@@ -99,6 +99,7 @@ def run_method(
     train_steps: int,
     args: argparse.Namespace,
     results_dir: str,
+    use_mlp: bool = False,
 ) -> Dict[str, float | None]:
     output_dir = os.path.join(results_dir, name)
     config = LearnableAlphaConfig(
@@ -116,6 +117,7 @@ def run_method(
         num_training_steps=train_steps,
         max_seq_length=args.max_seq_length,
         random_seed=args.seed,
+        use_mlp=use_mlp,
     )
 
     runner = LearnableAlphaMKA(config)
@@ -169,6 +171,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_subjects", type=int, default=None)
     parser.add_argument("--max_eval_samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--include_mlp", action="store_true", help="Include MLP-based merging experiments")
     return parser.parse_args()
 
 
@@ -205,6 +208,16 @@ def main() -> None:
         args=args,
         results_dir=args.output_dir,
     )
+    
+    if args.include_mlp:
+        results["learned_mlp"] = run_method(
+            name="learned_alpha_mlp",
+            alpha_strategy="uniform",
+            train_steps=args.num_training_steps,
+            args=args,
+            results_dir=args.output_dir,
+            use_mlp=True,
+        )
 
     with open(os.path.join(args.output_dir, "results.json"), "w", encoding="utf-8") as handle:
         json.dump(results, handle, indent=2)

@@ -19,7 +19,7 @@ import logging
 import gc              
 from torch.utils.data import DataLoader, Dataset
 
-from mergeable_layer import MergeableLayer, create_mergeable_layer
+from mergeable_layer import MergeableLayer, MLPMergeableLayer, create_mergeable_layer
 
 # Define the possible choices for multiple-choice questions
 choices = ["A", "B", "C", "D"]
@@ -692,6 +692,7 @@ def replace_layers_with_mergeable(
     model,
     merge_pairs,
     alpha_init_strategy="similarity",
+    use_mlp=False,
 ):
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         layers = model.model.layers
@@ -707,6 +708,8 @@ def replace_layers_with_mergeable(
             return 0.7
         raise ValueError(f"Unknown alpha init strategy: {alpha_init_strategy}")
 
+    mode = "mlp" if use_mlp else "simple"
+    
     for layer_l_idx, layer_m_idx, sim_score in sorted(merge_pairs, key=lambda x: x[0], reverse=True):
         layer_l = layers[layer_l_idx]
         layer_m = layers[layer_m_idx]
@@ -714,6 +717,7 @@ def replace_layers_with_mergeable(
             layer_l,
             layer_m,
             alpha_init=_alpha_from_strategy(sim_score),
+            mode=mode,
         )
         setattr(mergeable, "layer_pair", (layer_l_idx, layer_m_idx))
         layers[layer_l_idx] = mergeable
@@ -797,6 +801,10 @@ def extract_learned_alphas(model, merge_pairs):
             pair = getattr(module, "layer_pair", (layer_l_idx, layer_m_idx))
             learned_key = f"{pair[0]}_{pair[1]}"
             learned[learned_key] = float(module.alpha.detach().cpu().item())
+        elif isinstance(module, MLPMergeableLayer):
+            pair = getattr(module, "layer_pair", (layer_l_idx, layer_m_idx))
+            learned_key = f"{pair[0]}_{pair[1]}_mlp"
+            learned[learned_key] = -1.0  # MLP mode indicator
     return learned
 
 
@@ -824,6 +832,10 @@ def fuse_mergeable_layers(model):
         if isinstance(layer, MergeableLayer):
             alpha = float(layer.alpha.detach().cpu().item())
             new_layers.append(_fuse_layers(layer.layer_l, layer.layer_m, alpha))
+        elif isinstance(layer, MLPMergeableLayer):
+            # MLP layers use 0.5 for fusion since alpha is dynamic
+            print(f"Fusing MLP layer with fixed ratio 0.5")
+            new_layers.append(_fuse_layers(layer.layer_l, layer.layer_m, 0.5))
         elif isinstance(layer, nn.Identity):
             continue
         else:
@@ -859,6 +871,7 @@ def main():
     parser.add_argument("--calibration_batch_size", type=int, default=4, help="Batch size for calibration dataloader")
     parser.add_argument("--calibration_seed", type=int, default=7, help="Random seed for calibration sampling")
     parser.add_argument("--calibration_max_seq_len", type=int, default=512, help="Maximum sequence length for calibration prompts")
+    parser.add_argument("--use_mlp_merge", action="store_true", help="Use MLP-based merging instead of scalar alpha")
     args = parser.parse_args()
 
     # Extract the model name from the provided model path
@@ -1001,6 +1014,7 @@ def main():
             model,
             merge_pairs,
             alpha_init_strategy=args.alpha_init_strategy,
+            use_mlp=args.use_mlp_merge,
         )
 
         calibration_loader = prepare_calibration_dataloader(
