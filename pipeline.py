@@ -876,8 +876,8 @@ def main():
 
     # Extract the model name from the provided model path
     model_name = args.model_path.split("/")[-1]
-    # Define the base directory for storing fused model information
-    base_dir = f"/data/yangzhao/point/EMNLP2024/layer_fus/al/{model_name}/fused_{args.num_layer}_layers"
+    # Define the base directory for storing fused model information (relative path)
+    base_dir = f"./output/{model_name}/fused_{args.num_layer}_layers"
 
     # Define directories for embeddings, fusion info, and merged weights
     iteration_dir = os.path.join(base_dir, f"iteration")
