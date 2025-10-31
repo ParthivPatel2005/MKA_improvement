@@ -37,7 +37,8 @@ Pruning-via-Merging/
 # FILE 1: mergeable_layer.py (NEW FILE)
 # =============================================================================
 
-MERGEABLE_LAYER_CODE = '''
+MERGEABLE_LAYER_CODE = 
+```python
 """
 Mergeable Layer Module for Learnable Alpha MKA
 
