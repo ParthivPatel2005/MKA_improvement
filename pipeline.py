@@ -129,7 +129,8 @@ def eval(args, subject, model, tokenizer, dev_df, test_df):
         labels[:, :-len(tokenizer(prompt_end).input_ids)] = -100
 
         # Forward pass through the model to get outputs
-        outputs = model(input_ids=input_ids, labels=labels)
+        # Disable caching to avoid index errors with reduced layer count
+        outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
         # Extract logits for the last token
         logits = outputs.logits[:, -1, :]
         # Extract loss for the current example
@@ -336,7 +337,8 @@ def extract_layer_params(model, layer_idx, input_ids):
     """
     # Perform a forward pass with no gradient computation to get hidden states
     with torch.no_grad():
-        outputs = model(input_ids=input_ids, output_hidden_states=True)
+        # Disable caching to avoid index errors with reduced layer count
+        outputs = model(input_ids=input_ids, output_hidden_states=True, use_cache=False)
         hidden_states = outputs.hidden_states  # List of hidden states from each layer
         # Extract activations from the specified layer and move to CPU
         activations = hidden_states[layer_idx].detach().float().cpu().numpy()
@@ -710,9 +712,20 @@ def replace_layers_with_mergeable(
 
     mode = "mlp" if use_mlp else "simple"
     
-    for layer_l_idx, layer_m_idx, sim_score in sorted(merge_pairs, key=lambda x: x[0], reverse=True):
+    # Process pairs and build new layer list
+    # We'll create a mapping of old indices to new layers
+    indices_to_remove = set()
+    
+    for layer_l_idx, layer_m_idx, sim_score in merge_pairs:
+        indices_to_remove.add(layer_m_idx)
+    
+    # Sort pairs by first index to process in order
+    for layer_l_idx, layer_m_idx, sim_score in sorted(merge_pairs, key=lambda x: x[0]):
+        # Get the actual layers before any replacement
         layer_l = layers[layer_l_idx]
         layer_m = layers[layer_m_idx]
+        
+        # Create mergeable wrapper with both layers
         mergeable = create_mergeable_layer(
             layer_l,
             layer_m,
@@ -720,8 +733,25 @@ def replace_layers_with_mergeable(
             mode=mode,
         )
         setattr(mergeable, "layer_pair", (layer_l_idx, layer_m_idx))
+        
+        # Replace layer_l with the mergeable wrapper
         layers[layer_l_idx] = mergeable
-        layers[layer_m_idx] = nn.Identity()
+    
+    # Build new layer list excluding the merged layers
+    new_layers = []
+    for idx, layer in enumerate(layers):
+        if idx not in indices_to_remove:
+            new_layers.append(layer)
+    
+    # Update the model with the new layer list
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        model.model.layers = nn.ModuleList(new_layers)
+    else:
+        model.layers = nn.ModuleList(new_layers)
+    
+    # Update config to reflect new layer count
+    model.config.num_hidden_layers = len(new_layers)
+    print(f"Reduced model from {len(layers)} to {len(new_layers)} layers")
 
     return model
 
@@ -772,7 +802,8 @@ def train_alpha_parameters(
         batch = {
             k: v.to(target_device) if hasattr(v, "to") else v for k, v in batch.items()
         }
-        outputs = model(**batch)
+        # Disable caching to avoid index errors with reduced layer count
+        outputs = model(**batch, use_cache=False)
         loss = outputs.loss
         optimizer.zero_grad()
         loss.backward()
@@ -789,22 +820,31 @@ def train_alpha_parameters(
 
 
 def extract_learned_alphas(model, merge_pairs):
+    """
+    Extract learned alpha values from MergeableLayer instances in the model.
+    Since layers have been removed after merging, we iterate through all layers
+    to find MergeableLayer instances instead of using original indices.
+    """
     learned = {}
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         layers = model.model.layers
     else:
         layers = model.layers
 
-    for layer_l_idx, layer_m_idx, _ in merge_pairs:
-        module = layers[layer_l_idx]
+    # Iterate through all layers to find MergeableLayer instances
+    for idx, module in enumerate(layers):
         if isinstance(module, MergeableLayer):
-            pair = getattr(module, "layer_pair", (layer_l_idx, layer_m_idx))
-            learned_key = f"{pair[0]}_{pair[1]}"
-            learned[learned_key] = float(module.alpha.detach().cpu().item())
+            # Get the original layer pair indices stored in the module
+            pair = getattr(module, "layer_pair", None)
+            if pair is not None:
+                learned_key = f"{pair[0]}_{pair[1]}"
+                learned[learned_key] = float(module.alpha.detach().cpu().item())
         elif isinstance(module, MLPMergeableLayer):
-            pair = getattr(module, "layer_pair", (layer_l_idx, layer_m_idx))
-            learned_key = f"{pair[0]}_{pair[1]}_mlp"
-            learned[learned_key] = -1.0  # MLP mode indicator
+            pair = getattr(module, "layer_pair", None)
+            if pair is not None:
+                learned_key = f"{pair[0]}_{pair[1]}_mlp"
+                learned[learned_key] = -1.0  # MLP mode indicator
+    
     return learned
 
 
@@ -836,8 +876,6 @@ def fuse_mergeable_layers(model):
             # MLP layers use 0.5 for fusion since alpha is dynamic
             print(f"Fusing MLP layer with fixed ratio 0.5")
             new_layers.append(_fuse_layers(layer.layer_l, layer.layer_m, 0.5))
-        elif isinstance(layer, nn.Identity):
-            continue
         else:
             new_layers.append(layer)
 
@@ -921,6 +959,9 @@ def main():
         device_map="auto",         # Automatically map layers to available devices
         torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32,  # Use bfloat16 if supported
     )
+    
+    # Disable caching in config to prevent cache size mismatches after layer merging
+    model.config.use_cache = False
 
     print(f"Initial model configuration: {model.config}")  # Display the model's configuration
 
@@ -1022,6 +1063,16 @@ def main():
             alpha_init_strategy=args.alpha_init_strategy,
             use_mlp=args.use_mlp_merge,
         )
+        
+        # Debug: Check layer types
+        print(f"\nLayer structure after replacement:")
+        if hasattr(model, "model") and hasattr(model.model, "layers"):
+            layers = model.model.layers
+        else:
+            layers = model.layers
+        for idx, layer in enumerate(layers):
+            layer_type = type(layer).__name__
+            print(f"  Layer {idx}: {layer_type}")
 
         calibration_loader = prepare_calibration_dataloader(
             tokenizer=tokenizer,
@@ -1040,10 +1091,22 @@ def main():
             device=device,
         )
 
-        learned_alphas = extract_learned_alphas(model, merge_pairs)
+        learned_alphas_dict = extract_learned_alphas(model, merge_pairs)
+        
+        # Convert to lists for easier visualization, maintaining order from merge_pairs
+        learned_alphas_list = []
+        similarity_scores_list = []
+        for layer_l_idx, layer_m_idx, _ in merge_pairs:
+            key = f"{layer_l_idx}_{layer_m_idx}"
+            if key in learned_alphas_dict:
+                learned_alphas_list.append(learned_alphas_dict[key])
+                similarity_scores_list.append(similarity_scores.get(key, 0.0))
+        
         learned_payload = {
-            "learned_alphas": learned_alphas,
-            "similarity_scores": similarity_scores,
+            "learned_alphas": learned_alphas_list,
+            "similarity_scores": similarity_scores_list,
+            "layer_pairs": [(l, m) for l, m, _ in merge_pairs],
+            "alphas_by_pair": learned_alphas_dict,  # Keep dict version for reference
         }
         with open(os.path.join(merged_weights_dir, "learned_alphas.json"), "w") as f:
             json.dump(learned_payload, f, indent=2)
