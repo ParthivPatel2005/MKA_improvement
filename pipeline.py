@@ -961,8 +961,8 @@ def main():
         for index in tqdm(sample_indices, desc=f"Processing {subject}"):
             # Format the test example without the answer
             prompt = format_example(test_df, index, include_answer=False)
-            # Tokenize the prompt and move to GPU
-            input_ids = tokenizer(prompt, return_tensors="pt").input_ids.cuda()
+            # Tokenize the prompt and move to device (GPU if available, else CPU)
+            input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
             # Iterate over each layer to extract activations
             for layer_idx in range(num_layers):
