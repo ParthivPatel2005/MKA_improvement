@@ -907,6 +907,12 @@ def main():
         add_eos_token=False,       # Do not add end-of-sequence token
         padding_side="left"        # Pad sequences on the left side
     )
+    
+    # Set padding token if not already set (required for batch processing)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        print(f"Set pad_token to eos_token: {tokenizer.pad_token}")
 
     # Load the pre-trained causal language model with appropriate settings
     model = AutoModelForCausalLM.from_pretrained(
