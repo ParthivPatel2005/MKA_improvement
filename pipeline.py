@@ -1041,16 +1041,31 @@ def main():
 
     merge_pairs = []
     similarity_scores = {}
-    temp_layers = num_layers
-    for _ in range(min(args.num_layer, num_layers - 1)):
-        if temp_layers <= 1:
-            break
-        layer1_idx = temp_layers - 2
-        layer2_idx = temp_layers - 1
-        sim_score = float(similarity_matrix[layer1_idx, layer2_idx])
-        merge_pairs.append((layer1_idx, layer2_idx, sim_score))
-        similarity_scores[f"{layer1_idx}_{layer2_idx}"] = sim_score
-        temp_layers -= 1
+
+    if args.use_learnable_alpha:
+        # Choose non-overlapping adjacent pairs from the top: (L-2,L-1), (L-4,L-3), ...
+        # This ensures all selected pairs keep their mergeable wrapper for training.
+        pairs_needed = min(args.num_layer, num_layers // 2)
+        l = num_layers - 2
+        while l >= 0 and len(merge_pairs) < pairs_needed:
+            layer1_idx = l
+            layer2_idx = l + 1
+            sim_score = float(similarity_matrix[layer1_idx, layer2_idx])
+            merge_pairs.append((layer1_idx, layer2_idx, sim_score))
+            similarity_scores[f"{layer1_idx}_{layer2_idx}"] = sim_score
+            l -= 2
+    else:
+        # Original sequential (overlapping) strategy for static fusion, reducing one layer each step
+        temp_layers = num_layers
+        for _ in range(min(args.num_layer, num_layers - 1)):
+            if temp_layers <= 1:
+                break
+            layer1_idx = temp_layers - 2
+            layer2_idx = temp_layers - 1
+            sim_score = float(similarity_matrix[layer1_idx, layer2_idx])
+            merge_pairs.append((layer1_idx, layer2_idx, sim_score))
+            similarity_scores[f"{layer1_idx}_{layer2_idx}"] = sim_score
+            temp_layers -= 1
 
     if args.use_learnable_alpha and merge_pairs:
         print("\n" + "=" * 60)
@@ -1074,6 +1089,20 @@ def main():
             layer_type = type(layer).__name__
             print(f"  Layer {idx}: {layer_type}")
 
+        # Capture initial (pre-training) alphas from MergeableLayer wrappers (clamped values actually used)
+        initial_alphas_dict = {}
+        for module in layers:
+            if isinstance(module, MergeableLayer):
+                pair = getattr(module, "layer_pair", None)
+                if pair is not None:
+                    key = f"{pair[0]}_{pair[1]}"
+                    initial_alphas_dict[key] = float(module.alpha.detach().cpu().item())
+            elif isinstance(module, MLPMergeableLayer):
+                pair = getattr(module, "layer_pair", None)
+                if pair is not None:
+                    key = f"{pair[0]}_{pair[1]}_mlp"
+                    initial_alphas_dict[key] = -1.0  # dynamic indicator
+
         calibration_loader = prepare_calibration_dataloader(
             tokenizer=tokenizer,
             data_dir=args.data_dir,
@@ -1096,18 +1125,51 @@ def main():
         # Convert to lists for easier visualization, maintaining order from merge_pairs
         learned_alphas_list = []
         similarity_scores_list = []
+        initial_alphas_list = []
         for layer_l_idx, layer_m_idx, _ in merge_pairs:
             key = f"{layer_l_idx}_{layer_m_idx}"
             if key in learned_alphas_dict:
                 learned_alphas_list.append(learned_alphas_dict[key])
                 similarity_scores_list.append(similarity_scores.get(key, 0.0))
+                # initial alpha (clamped) as used by wrapper
+                init_val = initial_alphas_dict.get(key, None)
+                if init_val is not None:
+                    initial_alphas_list.append(init_val)
+                else:
+                    initial_alphas_list.append(None)
         
         learned_payload = {
             "learned_alphas": learned_alphas_list,
             "similarity_scores": similarity_scores_list,
             "layer_pairs": [(l, m) for l, m, _ in merge_pairs],
             "alphas_by_pair": learned_alphas_dict,  # Keep dict version for reference
+            "initial_alphas": initial_alphas_list,
+            "initial_alphas_by_pair": initial_alphas_dict,
         }
+        # Print a concise summary for quick inspection
+        print("\n" + "-" * 60)
+        print("LEARNED ALPHAS SUMMARY (after training)")
+        print("-" * 60)
+        for layer_l_idx, layer_m_idx, _ in merge_pairs:
+            key = f"{layer_l_idx}_{layer_m_idx}"
+            key_mlp = f"{key}_mlp"
+            sim = similarity_scores.get(key, None)
+            if key in learned_alphas_dict:
+                la = learned_alphas_dict[key]
+                init_val = initial_alphas_dict.get(key, None)
+                sim_str = f"{sim:.4f}" if sim is not None else "n/a"
+                if init_val is not None:
+                    diff = la - init_val
+                    print(f"  pair {key}: similarity={sim_str}, init_alpha={init_val:.4f}, learned_alpha={la:.4f}, diff={diff:+.4f}")
+                else:
+                    print(f"  pair {key}: similarity={sim_str}, learned_alpha={la:.4f}")
+            elif key_mlp in learned_alphas_dict:
+                sim_str = f"{sim:.4f}" if sim is not None else "n/a"
+                print(f"  pair {key}: similarity={sim_str}, learned_alpha=dynamic (MLP)")
+            else:
+                sim_str = f"{sim:.4f}" if sim is not None else "n/a"
+                print(f"  pair {key}: similarity={sim_str}, learned_alpha=unknown")
+        print("-" * 60)
         with open(os.path.join(merged_weights_dir, "learned_alphas.json"), "w") as f:
             json.dump(learned_payload, f, indent=2)
 
